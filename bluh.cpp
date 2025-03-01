@@ -652,3 +652,18 @@ void process_x11_events() {
                     }
                 }
                 break;
+                
+            case ConfigureNotify:
+                // Обработка изменения размера окна
+                if (event.xconfigure.window == root_window) {
+                    screen_width = event.xconfigure.width;
+                    screen_height = event.xconfigure.height;
+                    glViewport(0, 0, screen_width, screen_height);
+                }
+                break;
+                
+            default:
+                break;
+        }
+    }
+}
