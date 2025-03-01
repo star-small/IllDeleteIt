@@ -3,366 +3,302 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <GL/glew.h>
-#include <GLFW/glfw3.h>
+#include <unistd.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/cursorfont.h>
+#include <GLES2/gl2.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <signal.h>
+#include <sys/wait.h>
 
-// Window dimensions
-#define WIDTH 800
-#define HEIGHT 600
+// Настройки окружения рабочего стола
+#define WINDOW_TITLE "OpenGL ES Desktop Environment"
+#define BACKGROUND_COLOR 0.05f, 0.1f, 0.2f, 1.0f  // Темно-синий фон
 
-// Shader sources
-const char* vertexShaderSource = "#version 330 core\n"
-    "layout (location = 0) in vec3 aPos;\n"
-    "layout (location = 1) in vec3 aNormal;\n"
-    "layout (location = 2) in vec2 aTexCoord;\n"
-    "out vec3 FragPos;\n"
-    "out vec3 Normal;\n"
-    "out vec2 TexCoord;\n"
+// Шейдеры
+const char* vertexShaderSource = 
+    "attribute vec3 aPos;\n"
+    "attribute vec3 aNormal;\n"
+    "varying vec3 FragPos;\n"
+    "varying vec3 Normal;\n"
     "uniform mat4 model;\n"
     "uniform mat4 view;\n"
     "uniform mat4 projection;\n"
     "void main()\n"
     "{\n"
     "    FragPos = vec3(model * vec4(aPos, 1.0));\n"
-    "    Normal = mat3(transpose(inverse(model))) * aNormal;\n"
-    "    TexCoord = aTexCoord;\n"
-    "    gl_Position = projection * view * vec4(FragPos, 1.0);\n"
+    "    Normal = mat3(model) * aNormal;\n"
+    "    gl_Position = projection * view * model * vec4(aPos, 1.0);\n"
     "}\0";
 
-const char* fragmentShaderSource = "#version 330 core\n"
-    "out vec4 FragColor;\n"
-    "in vec3 FragPos;\n"
-    "in vec3 Normal;\n"
-    "in vec2 TexCoord;\n"
+const char* fragmentShaderSource = 
+    "precision mediump float;\n"
+    "varying vec3 FragPos;\n"
+    "varying vec3 Normal;\n"
     "uniform vec3 lightPos;\n"
     "uniform vec3 viewPos;\n"
     "uniform vec3 lightColor;\n"
     "uniform vec3 objectColor;\n"
     "void main()\n"
     "{\n"
-    "    // Ambient lighting\n"
+    "    // Фоновое освещение\n"
     "    float ambientStrength = 0.2;\n"
     "    vec3 ambient = ambientStrength * lightColor;\n"
-    "    // Diffuse lighting\n"
+    "    // Диффузное освещение\n"
     "    vec3 norm = normalize(Normal);\n"
     "    vec3 lightDir = normalize(lightPos - FragPos);\n"
     "    float diff = max(dot(norm, lightDir), 0.0);\n"
     "    vec3 diffuse = diff * lightColor;\n"
-    "    // Specular lighting\n"
-    "    float specularStrength = 0.5;\n"
-    "    vec3 viewDir = normalize(viewPos - FragPos);\n"
-    "    vec3 reflectDir = reflect(-lightDir, norm);\n"
-    "    float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32);\n"
-    "    vec3 specular = specularStrength * spec * lightColor;\n"
-    "    // Combine results\n"
-    "    vec3 result = (ambient + diffuse + specular) * objectColor;\n"
-    "    FragColor = vec4(result, 1.0);\n"
+    "    // Объединяем результаты\n"
+    "    vec3 result = (ambient + diffuse) * objectColor;\n"
+    "    gl_FragColor = vec4(result, 1.0);\n"
     "}\0";
 
-// Struct for matrices
+// Структура для матриц 4x4
 typedef struct {
     float m[16];
 } Matrix4;
 
-// Function prototypes
-void framebuffer_size_callback(GLFWwindow* window, int width, int height);
-void processInput(GLFWwindow* window);
-unsigned int createShaderProgram(const char* vertexShaderSource, const char* fragmentShaderSource);
-Matrix4 perspective(float fovy, float aspect, float near, float far);
-Matrix4 lookAt(float eyeX, float eyeY, float eyeZ, float centerX, float centerY, float centerZ, float upX, float upY, float upZ);
-Matrix4 identity();
-Matrix4 translate(Matrix4 m, float x, float y, float z);
-Matrix4 rotate(Matrix4 m, float angle, float x, float y, float z);
-void setMat4(unsigned int shader, const char* name, Matrix4 mat);
-void setVec3(unsigned int shader, const char* name, float x, float y, float z);
+// X11 и EGL переменные
+Display* x_display = NULL;
+Window root_window;
+EGLDisplay egl_display;
+EGLSurface egl_surface;
+EGLContext egl_context;
+EGLConfig egl_config;
+int screen_width, screen_height;
+int running = 1;
 
-// Vertex data for a cube
+// Переменные для 3D объектов
+unsigned int shaderProgram;
+unsigned int VBO;
+
+// Данные вершин для куба
 float vertices[] = {
-    // positions          // normals           // texture coords
-    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  0.0f, 0.0f,
-     0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  1.0f, 0.0f,
-     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  1.0f, 1.0f,
-     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  1.0f, 1.0f,
-    -0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  0.0f, 1.0f,
-    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,  0.0f, 0.0f,
+    // позиции          // нормали
+    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+    -0.5f,  0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
+    -0.5f, -0.5f, -0.5f,  0.0f,  0.0f, -1.0f,
 
-    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  0.0f, 0.0f,
-     0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  1.0f, 0.0f,
-     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  1.0f, 1.0f,
-     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  1.0f, 1.0f,
-    -0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  0.0f, 1.0f,
-    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,  0.0f, 0.0f,
+    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+    -0.5f,  0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
+    -0.5f, -0.5f,  0.5f,  0.0f,  0.0f,  1.0f,
 
-    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,  1.0f, 0.0f,
-    -0.5f,  0.5f, -0.5f, -1.0f,  0.0f,  0.0f,  1.0f, 1.0f,
-    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,  0.0f, 1.0f,
-    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,  0.0f, 1.0f,
-    -0.5f, -0.5f,  0.5f, -1.0f,  0.0f,  0.0f,  0.0f, 0.0f,
-    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,  1.0f, 0.0f,
+    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f,  0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f, -0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
+    -0.5f,  0.5f,  0.5f, -1.0f,  0.0f,  0.0f,
 
-     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,  1.0f, 0.0f,
-     0.5f,  0.5f, -0.5f,  1.0f,  0.0f,  0.0f,  1.0f, 1.0f,
-     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,  0.0f, 1.0f,
-     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,  0.0f, 1.0f,
-     0.5f, -0.5f,  0.5f,  1.0f,  0.0f,  0.0f,  0.0f, 0.0f,
-     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,  1.0f, 0.0f,
+     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f,  0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  1.0f,  0.0f,  0.0f,
 
-    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,  0.0f, 1.0f,
-     0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,  1.0f, 1.0f,
-     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,  1.0f, 0.0f,
-     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,  1.0f, 0.0f,
-    -0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,  0.0f, 0.0f,
-    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,  0.0f, 1.0f,
+    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+     0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+    -0.5f, -0.5f,  0.5f,  0.0f, -1.0f,  0.0f,
+    -0.5f, -0.5f, -0.5f,  0.0f, -1.0f,  0.0f,
 
-    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,  0.0f, 1.0f,
-     0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,  1.0f, 1.0f,
-     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,  1.0f, 0.0f,
-     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,  1.0f, 0.0f,
-    -0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,  0.0f, 0.0f,
-    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,  0.0f, 1.0f
+    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+     0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+    -0.5f,  0.5f,  0.5f,  0.0f,  1.0f,  0.0f,
+    -0.5f,  0.5f, -0.5f,  0.0f,  1.0f,  0.0f
 };
 
-// Cube positions
+// Позиции декоративных 3D объектов
 float cubePositions[][3] = {
-    { 0.0f,  0.0f,  0.0f},
-    { 2.0f,  5.0f, -15.0f},
-    {-1.5f, -2.2f, -2.5f},
-    {-3.8f, -2.0f, -12.3f},
-    { 2.4f, -0.4f, -3.5f}
+    { -2.0f,  0.0f, -5.0f},
+    {  2.0f,  1.0f, -6.0f},
+    { -1.5f, -1.2f, -3.0f},
+    {  1.8f, -0.6f, -4.0f},
+    {  0.0f,  0.8f, -2.0f}
 };
 
-// Camera variables
+// Камера
 float cameraPos[3] = {0.0f, 0.0f, 3.0f};
 float cameraFront[3] = {0.0f, 0.0f, -1.0f};
 float cameraUp[3] = {0.0f, 1.0f, 0.0f};
-float deltaTime = 0.0f;
-float lastFrame = 0.0f;
 
-// Main function
-int main() {
-    // Initialize GLFW
-    if (!glfwInit()) {
-        fprintf(stderr, "Failed to initialize GLFW\n");
-        return -1;
+// Обработчик сигналов
+void signal_handler(int signal) {
+    if (signal == SIGINT || signal == SIGTERM) {
+        running = 0;
     }
-    
-    // Configure GLFW
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+}
 
-    // Create window
-    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "OpenGL 3D Scene for Orange Pi CM4", NULL, NULL);
-    if (window == NULL) {
-        fprintf(stderr, "Failed to create GLFW window\n");
-        glfwTerminate();
-        return -1;
-    }
-    
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-
-    // Initialize GLEW
-    if (glewInit() != GLEW_OK) {
-        fprintf(stderr, "Failed to initialize GLEW\n");
-        return -1;
+// Функции для работы с X11
+int init_x11() {
+    x_display = XOpenDisplay(NULL);
+    if (x_display == NULL) {
+        fprintf(stderr, "Не удалось открыть соединение с X сервером\n");
+        return 0;
     }
 
-    // Create shader program
-    unsigned int shaderProgram = createShaderProgram(vertexShaderSource, fragmentShaderSource);
+    int screen = DefaultScreen(x_display);
+    root_window = RootWindow(x_display, screen);
+    screen_width = DisplayWidth(x_display, screen);
+    screen_height = DisplayHeight(x_display, screen);
 
-    // VAO, VBO
-    unsigned int VAO, VBO;
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
+    // Захватываем контроль над корневым окном для управления рабочим столом
+    XSelectInput(x_display, root_window, 
+                 ButtonPressMask | ButtonReleaseMask | 
+                 PointerMotionMask | KeyPressMask | KeyReleaseMask | 
+                 ExposureMask | StructureNotifyMask);
 
-    glBindVertexArray(VAO);
+    // Устанавливаем курсор
+    Cursor cursor = XCreateFontCursor(x_display, XC_left_ptr);
+    XDefineCursor(x_display, root_window, cursor);
+    XFreeCursor(x_display, cursor);
 
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    return 1;
+}
 
-    // Position attribute
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
+// Функции для работы с EGL
+int init_egl() {
+    egl_display = eglGetDisplay((EGLNativeDisplayType)x_display);
+    if (egl_display == EGL_NO_DISPLAY) {
+        fprintf(stderr, "Не удалось получить EGL дисплей\n");
+        return 0;
+    }
+
+    if (!eglInitialize(egl_display, NULL, NULL)) {
+        fprintf(stderr, "Не удалось инициализировать EGL\n");
+        return 0;
+    }
+
+    // Выбираем конфигурацию EGL
+    const EGLint config_attribs[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 16,
+        EGL_NONE
+    };
     
-    // Normal attribute
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
+    EGLint num_configs;
+    if (!eglChooseConfig(egl_display, config_attribs, &egl_config, 1, &num_configs)) {
+        fprintf(stderr, "Не удалось выбрать конфигурацию EGL: %x\n", eglGetError());
+        return 0;
+    }
+
+    // Создаем EGL поверхность для корневого окна
+    egl_surface = eglCreateWindowSurface(egl_display, egl_config, 
+                                        (EGLNativeWindowType)root_window, NULL);
+    if (egl_surface == EGL_NO_SURFACE) {
+        fprintf(stderr, "Не удалось создать поверхность EGL: %x\n", eglGetError());
+        return 0;
+    }
+
+    // Создаем контекст OpenGL ES 2.0
+    const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
     
-    // Texture coordinate attribute
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
-    glEnableVertexAttribArray(2);
+    egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, context_attribs);
+    if (egl_context == EGL_NO_CONTEXT) {
+        fprintf(stderr, "Не удалось создать контекст EGL: %x\n", eglGetError());
+        return 0;
+    }
 
-    // Enable depth testing
-    glEnable(GL_DEPTH_TEST);
+    // Делаем контекст текущим
+    if (!eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context)) {
+        fprintf(stderr, "Не удалось сделать контекст EGL текущим: %x\n", eglGetError());
+        return 0;
+    }
 
-    // Use shader program
-    glUseProgram(shaderProgram);
+    return 1;
+}
 
-    // Light properties
-    setVec3(shaderProgram, "lightColor", 1.0f, 1.0f, 1.0f);
-    setVec3(shaderProgram, "objectColor", 1.0f, 0.5f, 0.0f); // Orange color
-
-    // Render loop
-    while (!glfwWindowShouldClose(window)) {
-        // Calculate delta time
-        float currentFrame = glfwGetTime();
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
-
-        // Process input
-        processInput(window);
-
-        // Render
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        // Activate shader program
-        glUseProgram(shaderProgram);
-
-        // Update light position
-        float lightX = sin(glfwGetTime()) * 2.0f;
-        float lightY = sin(glfwGetTime() / 2.0f) * 1.0f;
-        float lightZ = cos(glfwGetTime()) * 2.0f;
-        setVec3(shaderProgram, "lightPos", lightX, lightY, lightZ);
-        setVec3(shaderProgram, "viewPos", cameraPos[0], cameraPos[1], cameraPos[2]);
-
-        // Create transformations
-        Matrix4 view = lookAt(
-            cameraPos[0], cameraPos[1], cameraPos[2],
-            cameraPos[0] + cameraFront[0], cameraPos[1] + cameraFront[1], cameraPos[2] + cameraFront[2],
-            cameraUp[0], cameraUp[1], cameraUp[2]
-        );
-        Matrix4 projection = perspective(45.0f, (float)WIDTH / (float)HEIGHT, 0.1f, 100.0f);
-
-        // Set transformation matrices
-        setMat4(shaderProgram, "view", view);
-        setMat4(shaderProgram, "projection", projection);
-
-        // Render cubes
-        glBindVertexArray(VAO);
-        for (unsigned int i = 0; i < 5; i++) {
-            // Calculate model matrix
-            Matrix4 model = identity();
-            model = translate(model, cubePositions[i][0], cubePositions[i][1], cubePositions[i][2]);
-            float angle = 20.0f * i + glfwGetTime() * 25.0f;
-            model = rotate(model, angle, 1.0f, 0.3f, 0.5f);
-            setMat4(shaderProgram, "model", model);
-
-            // Draw cube
-            glDrawArrays(GL_TRIANGLES, 0, 36);
+// Освобождение ресурсов EGL
+void deinit_egl() {
+    if (egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (egl_context != EGL_NO_CONTEXT) {
+            eglDestroyContext(egl_display, egl_context);
         }
-
-        // Swap buffers and poll events
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-    }
-
-    // Clean up
-    glDeleteVertexArrays(1, &VAO);
-    glDeleteBuffers(1, &VBO);
-    glDeleteProgram(shaderProgram);
-
-    glfwTerminate();
-    return 0;
-}
-
-// Process input
-void processInput(GLFWwindow* window) {
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, 1);
-
-    const float cameraSpeed = 2.5f * deltaTime;
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-        cameraPos[0] += cameraSpeed * cameraFront[0];
-        cameraPos[1] += cameraSpeed * cameraFront[1];
-        cameraPos[2] += cameraSpeed * cameraFront[2];
-    }
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-        cameraPos[0] -= cameraSpeed * cameraFront[0];
-        cameraPos[1] -= cameraSpeed * cameraFront[1];
-        cameraPos[2] -= cameraSpeed * cameraFront[2];
-    }
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-        float tmpX = cameraFront[1] * cameraUp[2] - cameraFront[2] * cameraUp[1];
-        float tmpY = cameraFront[2] * cameraUp[0] - cameraFront[0] * cameraUp[2];
-        float tmpZ = cameraFront[0] * cameraUp[1] - cameraFront[1] * cameraUp[0];
-        float len = sqrt(tmpX * tmpX + tmpY * tmpY + tmpZ * tmpZ);
-        tmpX /= len;
-        tmpY /= len;
-        tmpZ /= len;
-        cameraPos[0] -= cameraSpeed * tmpX;
-        cameraPos[1] -= cameraSpeed * tmpY;
-        cameraPos[2] -= cameraSpeed * tmpZ;
-    }
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-        float tmpX = cameraFront[1] * cameraUp[2] - cameraFront[2] * cameraUp[1];
-        float tmpY = cameraFront[2] * cameraUp[0] - cameraFront[0] * cameraUp[2];
-        float tmpZ = cameraFront[0] * cameraUp[1] - cameraFront[1] * cameraUp[0];
-        float len = sqrt(tmpX * tmpX + tmpY * tmpY + tmpZ * tmpZ);
-        tmpX /= len;
-        tmpY /= len;
-        tmpZ /= len;
-        cameraPos[0] += cameraSpeed * tmpX;
-        cameraPos[1] += cameraSpeed * tmpY;
-        cameraPos[2] += cameraSpeed * tmpZ;
+        if (egl_surface != EGL_NO_SURFACE) {
+            eglDestroySurface(egl_display, egl_surface);
+        }
+        eglTerminate(egl_display);
     }
 }
 
-// Callback for window resize
-void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
-    glViewport(0, 0, width, height);
+// Освобождение ресурсов X11
+void deinit_x11() {
+    if (x_display) {
+        XCloseDisplay(x_display);
+    }
 }
 
-// Create shader program
-unsigned int createShaderProgram(const char* vertexShaderSource, const char* fragmentShaderSource) {
-    // Vertex shader
-    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
-    glCompileShader(vertexShader);
+// Создание шейдерной программы
+unsigned int create_shader_program(const char* vertex_source, const char* fragment_source) {
+    // Вершинный шейдер
+    unsigned int vertex_shader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertex_shader, 1, &vertex_source, NULL);
+    glCompileShader(vertex_shader);
     
-    // Check for errors
+    // Проверка ошибок компиляции вершинного шейдера
     int success;
-    char infoLog[512];
-    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    char info_log[512];
+    glGetShaderiv(vertex_shader, GL_COMPILE_STATUS, &success);
     if (!success) {
-        glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
-        fprintf(stderr, "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n%s\n", infoLog);
+        glGetShaderInfoLog(vertex_shader, 512, NULL, info_log);
+        fprintf(stderr, "Ошибка компиляции вершинного шейдера: %s\n", info_log);
     }
     
-    // Fragment shader
-    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
-    glCompileShader(fragmentShader);
+    // Фрагментный шейдер
+    unsigned int fragment_shader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragment_shader, 1, &fragment_source, NULL);
+    glCompileShader(fragment_shader);
     
-    // Check for errors
-    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    // Проверка ошибок компиляции фрагментного шейдера
+    glGetShaderiv(fragment_shader, GL_COMPILE_STATUS, &success);
     if (!success) {
-        glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
-        fprintf(stderr, "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n%s\n", infoLog);
+        glGetShaderInfoLog(fragment_shader, 512, NULL, info_log);
+        fprintf(stderr, "Ошибка компиляции фрагментного шейдера: %s\n", info_log);
     }
     
-    // Shader program
-    unsigned int shaderProgram = glCreateProgram();
-    glAttachShader(shaderProgram, vertexShader);
-    glAttachShader(shaderProgram, fragmentShader);
-    glLinkProgram(shaderProgram);
+    // Связывание шейдеров в программу
+    unsigned int shader_program = glCreateProgram();
+    glAttachShader(shader_program, vertex_shader);
+    glAttachShader(shader_program, fragment_shader);
+    glLinkProgram(shader_program);
     
-    // Check for errors
-    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+    // Проверка ошибок связывания
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
     if (!success) {
-        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
-        fprintf(stderr, "ERROR::SHADER::PROGRAM::LINKING_FAILED\n%s\n", infoLog);
+        glGetProgramInfoLog(shader_program, 512, NULL, info_log);
+        fprintf(stderr, "Ошибка связывания шейдерной программы: %s\n", info_log);
     }
     
-    // Delete shaders
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
+    // Удаляем шейдеры, они уже связаны с программой
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
     
-    return shaderProgram;
+    return shader_program;
 }
 
-// Matrix functions
+// Функции для работы с матрицами
 Matrix4 identity() {
     Matrix4 mat;
     memset(mat.m, 0, sizeof(float) * 16);
@@ -427,7 +363,7 @@ Matrix4 rotate(Matrix4 m, float angle, float x, float y, float z) {
     rotation.m[14] = 0.0f;
     rotation.m[15] = 1.0f;
     
-    // Multiply m by rotation
+    // Умножаем m на rotation
     result.m[0] = m.m[0] * rotation.m[0] + m.m[4] * rotation.m[1] + m.m[8] * rotation.m[2];
     result.m[1] = m.m[1] * rotation.m[0] + m.m[5] * rotation.m[1] + m.m[9] * rotation.m[2];
     result.m[2] = m.m[2] * rotation.m[0] + m.m[6] * rotation.m[1] + m.m[10] * rotation.m[2];
@@ -494,3 +430,117 @@ Matrix4 lookAt(float eyeX, float eyeY, float eyeZ, float centerX, float centerY,
     }
     
     float u[3];
+    u[0] = s[1] * f[2] - s[2] * f[1];
+    u[1] = s[2] * f[0] - s[0] * f[2];
+    u[2] = s[0] * f[1] - s[1] * f[0];
+    
+    memset(result.m, 0, sizeof(float) * 16);
+    result.m[0] = s[0];
+    result.m[1] = u[0];
+    result.m[2] = -f[0];
+    result.m[3] = 0.0f;
+    
+    result.m[4] = s[1];
+    result.m[5] = u[1];
+    result.m[6] = -f[1];
+    result.m[7] = 0.0f;
+    
+    result.m[8] = s[2];
+    result.m[9] = u[2];
+    result.m[10] = -f[2];
+    result.m[11] = 0.0f;
+    
+    result.m[12] = -(s[0] * eyeX + s[1] * eyeY + s[2] * eyeZ);
+    result.m[13] = -(u[0] * eyeX + u[1] * eyeY + u[2] * eyeZ);
+    result.m[14] = f[0] * eyeX + f[1] * eyeY + f[2] * eyeZ;
+    result.m[15] = 1.0f;
+    
+    return result;
+}
+
+// Установка uniform переменных в шейдере
+void set_mat4(unsigned int shader, const char* name, Matrix4 mat) {
+    GLint loc = glGetUniformLocation(shader, name);
+    glUniformMatrix4fv(loc, 1, GL_FALSE, mat.m);
+}
+
+void set_vec3(unsigned int shader, const char* name, float x, float y, float z) {
+    GLint loc = glGetUniformLocation(shader, name);
+    glUniform3f(loc, x, y, z);
+}
+
+// Инициализация OpenGL ресурсов
+void init_gl() {
+    // Создаем шейдерную программу
+    shaderProgram = create_shader_program(vertexShaderSource, fragmentShaderSource);
+
+    // Создаем буфер вершин (VBO)
+    glGenBuffers(1, &VBO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    // Получаем местоположение атрибутов
+    GLint posAttrib = glGetAttribLocation(shaderProgram, "aPos");
+    GLint normalAttrib = glGetAttribLocation(shaderProgram, "aNormal");
+
+    // Настраиваем атрибуты
+    glVertexAttribPointer(posAttrib, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(posAttrib);
+    
+    glVertexAttribPointer(normalAttrib, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(normalAttrib);
+
+    // Включаем тест глубины
+    glEnable(GL_DEPTH_TEST);
+
+    // Используем шейдерную программу
+    glUseProgram(shaderProgram);
+
+    // Устанавливаем свойства света
+    set_vec3(shaderProgram, "lightColor", 1.0f, 1.0f, 1.0f);
+    set_vec3(shaderProgram, "objectColor", 1.0f, 0.5f, 0.0f);  // Оранжевый цвет для кубов
+}
+
+// Очистка OpenGL ресурсов
+void deinit_gl() {
+    glDeleteBuffers(1, &VBO);
+    glDeleteProgram(shaderProgram);
+}
+
+// Запуск приложения (вместо терминала)
+void launch_terminal() {
+    // Создаем дочерний процесс
+    pid_t pid = fork();
+    
+    if (pid == 0) {
+        // Дочерний процесс
+        // Запускаем терминал
+        execlp("xterm", "xterm", NULL);
+        // Если execlp вернулся, значит произошла ошибка
+        exit(1);
+    }
+}
+
+// Обработка событий X11
+void process_x11_events() {
+    XEvent event;
+    
+    // Проверяем наличие событий, но не блокируем
+    while (XPending(x_display)) {
+        XNextEvent(x_display, &event);
+        
+        switch (event.type) {
+            case ButtonPress:
+                // Обработка нажатия кнопки мыши
+                if (event.xbutton.button == 3) {  // Правая кнопка мыши
+                    launch_terminal();
+                }
+                break;
+                
+            case KeyPress:
+                // Обработка нажатия клавиши
+                {
+                    KeySym key = XLookupKeysym(&event.xkey, 0);
+                    if (key == XK_Escape) {
+                        running = 0;  // Выход по нажатию Escape
+                    } else if (key ==
