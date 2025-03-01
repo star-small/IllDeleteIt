@@ -142,6 +142,68 @@ void signal_handler(int signal) {
     }
 }
 
+// Главная функция
+int main() {
+    // Устанавливаем обработчики сигналов
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    printf("Запуск OpenGL ES среды рабочего стола для Orange Pi CM4...\n");
+    
+    // Инициализируем X11
+    if (!init_x11()) {
+        fprintf(stderr, "Не удалось инициализировать X11\n");
+        return 1;
+    }
+    
+    // Инициализируем EGL
+    if (!init_egl()) {
+        fprintf(stderr, "Не удалось инициализировать EGL\n");
+        deinit_x11();
+        return 1;
+    }
+    
+    // Инициализируем OpenGL
+    init_gl();
+    
+    // Время
+    struct timespec start, current;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    float current_time, last_time = 0.0f;
+    float delta_time = 0.0f;
+    
+    // Основной цикл
+    while (running) {
+        // Вычисляем дельту времени
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        current_time = (current.tv_sec - start.tv_sec) + 
+                      (current.tv_nsec - start.tv_nsec) / 1000000000.0f;
+        delta_time = current_time - last_time;
+        last_time = current_time;
+        
+        // Обрабатываем события X11
+        process_x11_events();
+        
+        // Рендерим сцену
+        render_scene(current_time);
+        
+        // Обмен буферов
+        eglSwapBuffers(egl_display, egl_surface);
+        
+        // Небольшая задержка для снижения нагрузки на CPU
+        usleep(10000);  // 10 мс
+    }
+    
+    // Очистка ресурсов
+    deinit_gl();
+    deinit_egl();
+    deinit_x11();
+    
+    printf("OpenGL ES среда рабочего стола завершила работу.\n");
+    
+    return 0;
+}
+
 // Функции для работы с X11
 int init_x11() {
     x_display = XOpenDisplay(NULL);
@@ -507,6 +569,48 @@ void deinit_gl() {
     glDeleteProgram(shaderProgram);
 }
 
+// Рендеринг сцены
+void render_scene(float current_time) {
+    // Очистка экрана
+    glClearColor(BACKGROUND_COLOR);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // Активируем шейдерную программу
+    glUseProgram(shaderProgram);
+
+    // Обновляем позицию источника света
+    float lightX = sin(current_time) * 2.0f;
+    float lightY = sin(current_time / 2.0f) * 1.0f;
+    float lightZ = cos(current_time) * 2.0f;
+    set_vec3(shaderProgram, "lightPos", lightX, lightY, lightZ);
+    set_vec3(shaderProgram, "viewPos", cameraPos[0], cameraPos[1], cameraPos[2]);
+
+    // Создаем матрицы трансформации
+    Matrix4 view = lookAt(
+        cameraPos[0], cameraPos[1], cameraPos[2],
+        cameraPos[0] + cameraFront[0], cameraPos[1] + cameraFront[1], cameraPos[2] + cameraFront[2],
+        cameraUp[0], cameraUp[1], cameraUp[2]
+    );
+    Matrix4 projection = perspective(45.0f, (float)screen_width / (float)screen_height, 0.1f, 100.0f);
+
+    // Устанавливаем матрицы трансформации
+    set_mat4(shaderProgram, "view", view);
+    set_mat4(shaderProgram, "projection", projection);
+
+    // Рендеринг кубов
+    for (unsigned int i = 0; i < 5; i++) {
+        // Вычисляем матрицу модели
+        Matrix4 model = identity();
+        model = translate(model, cubePositions[i][0], cubePositions[i][1], cubePositions[i][2]);
+        float angle = 20.0f * i + current_time * 15.0f;
+        model = rotate(model, angle, 1.0f, 0.3f, 0.5f);
+        set_mat4(shaderProgram, "model", model);
+
+        // Рисуем куб
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
+}
+
 // Запуск приложения (вместо терминала)
 void launch_terminal() {
     // Создаем дочерний процесс
@@ -543,4 +647,8 @@ void process_x11_events() {
                     KeySym key = XLookupKeysym(&event.xkey, 0);
                     if (key == XK_Escape) {
                         running = 0;  // Выход по нажатию Escape
-                    } else if (key ==
+                    } else if (key == XK_F1) {
+                        launch_terminal();  // Запуск терминала по F1
+                    }
+                }
+                break;
